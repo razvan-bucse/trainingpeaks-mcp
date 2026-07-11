@@ -33,6 +33,7 @@ class SimpleStep(BaseModel):
     intensityClass: str = Field(default="active")  # noqa: N815
     cadence_min: float | None = Field(default=None, ge=0, le=300)
     cadence_max: float | None = Field(default=None, ge=0, le=300)
+    end_on_lap: bool = Field(default=False)  # durata = minim sugerat; pasul se incheie pe lap button (openDuration)
 
     @field_validator("intensityClass")
     @classmethod
@@ -99,7 +100,7 @@ def _build_step_wire(step: SimpleStep) -> dict[str, Any]:
         "length": {"value": step.duration_seconds, "unit": "second"},
         "targets": targets,
         "intensityClass": step.intensityClass,
-        "openDuration": False,
+        "openDuration": step.end_on_lap,
     }
 
 
