@@ -309,13 +309,95 @@ async def tp_update_hr_zones(
                 "message": "Could not get athlete ID. Re-authenticate.",
             }
 
-        payload: dict[str, Any] = {}
-        if params.threshold_hr is not None:
-            payload["threshold"] = params.threshold_hr
-        if params.max_hr is not None:
-            payload["maximum"] = params.max_hr
-        if params.resting_hr is not None:
-            payload["resting"] = params.resting_hr
+        # The heartratezones endpoint expects the FULL zone-group structure
+        # (like powerzones), not just anchor values. Fetch current, patch, PUT.
+        settings_endpoint = f"/fitness/v1/athletes/{athlete_id}/settings"
+        settings_response = await client.get(settings_endpoint)
+        if settings_response.is_error:
+            return {
+                "isError": True,
+                "error_code": settings_response.error_code.value if settings_response.error_code else "API_ERROR",
+                "message": settings_response.message,
+            }
+        if not settings_response.data or not isinstance(settings_response.data, dict):
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": "No settings data returned.",
+            }
+
+        hr_zones = settings_response.data.get("heartRateZones")
+        if not isinstance(hr_zones, list) or not hr_zones:
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": "No heart rate zones found in athlete settings.",
+            }
+
+        target_index = next(
+            (idx for idx, zg in enumerate(hr_zones)
+             if isinstance(zg, dict) and zg.get("workoutTypeId") == 0),
+            0,
+        )
+        target = hr_zones[target_index]
+        if not isinstance(target, dict):
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": "Unexpected HR zone format returned by TrainingPeaks.",
+            }
+
+        current_threshold = target.get("threshold")
+        new_threshold = params.threshold_hr if params.threshold_hr is not None else current_threshold
+        new_max = params.max_hr if params.max_hr is not None else target.get("maximumHeartRate")
+        new_resting = params.resting_hr if params.resting_hr is not None else target.get("restingHeartRate")
+
+        # Rebuild zone boundaries scaled to the new threshold (top zone keeps its cap).
+        existing_zones = target.get("zones")
+        zones: list[dict[str, Any]] = []
+        if (
+            isinstance(existing_zones, list) and existing_zones
+            and isinstance(current_threshold, (int, float)) and current_threshold > 0
+            and isinstance(new_threshold, (int, float))
+        ):
+            scale = new_threshold / current_threshold
+            lower = 0
+            for i, zone in enumerate(existing_zones):
+                if not isinstance(zone, dict):
+                    zones = []
+                    break
+                if i == len(existing_zones) - 1:
+                    top = zone.get("maximum")
+                    top = int(top) if isinstance(top, (int, float)) else 255
+                    zones.append({"label": zone.get("label"), "minimum": lower, "maximum": top})
+                else:
+                    maximum = zone.get("maximum")
+                    if not isinstance(maximum, (int, float)):
+                        zones = []
+                        break
+                    new_upper = round(maximum * scale)
+                    zones.append({"label": zone.get("label"), "minimum": lower, "maximum": new_upper})
+                    lower = new_upper + 1
+        if not zones:
+            return {
+                "isError": True,
+                "error_code": "API_ERROR",
+                "message": "Could not rebuild HR zones from existing settings.",
+            }
+
+        updated_zone_group: dict[str, Any] = {
+            "threshold": new_threshold,
+            "maximumHeartRate": new_max,
+            "restingHeartRate": new_resting,
+            "calculationMethod": target.get("calculationMethod"),
+            "workoutTypeId": target.get("workoutTypeId"),
+            "zones": zones,
+        }
+        if "zoneCalculatorId" in target:
+            updated_zone_group["zoneCalculatorId"] = target.get("zoneCalculatorId")
+
+        payload = list(hr_zones)
+        payload[target_index] = updated_zone_group
 
         endpoint = f"/fitness/v2/athletes/{athlete_id}/heartratezones"
         response = await client.put(endpoint, json=payload)
@@ -329,8 +411,11 @@ async def tp_update_hr_zones(
 
         return {
             "success": True,
-            "message": "Heart rate zones updated.",
-            "updates": payload,
+            "threshold_hr": new_threshold,
+            "max_hr": new_max,
+            "resting_hr": new_resting,
+            "workout_type_id": updated_zone_group["workoutTypeId"],
+            "zones": zones,
         }
 
 
